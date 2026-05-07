@@ -14,8 +14,6 @@ from sklearn.ensemble import IsolationForest
 from sklearn.preprocessing import StandardScaler
 from sklearn.feature_extraction import FeatureHasher
 
-
-
 # ============================================================
 # EOL Error Code Dictionary
 # Based on provided EOL error-code matrix image.
@@ -26,7 +24,7 @@ ERROR_CODES = {
         "status_value": "2^0",
         "name": "Error Status detected",
         "description": "ETM Error Status detected; check V_ETM_Disturbance_Status for more error information.",
-        "root_hint": "ETM internal diagnostic or disturbance status."
+        "root_hint": "internal diagnostic or disturbance status."
     },
     1: {
         "status_value": "2^1",
@@ -173,8 +171,6 @@ ERROR_CODES = {
         "root_hint": "EEPROM write/readback mismatch."
     },
 }
-
-
 # ============================================================
 # Parsing
 # ============================================================
@@ -404,10 +400,6 @@ class PassModelBundle:
 def _build_training_matrix(passed_logs: List[ParsedLog],
                            feature_cols: List[str] = FEATURE_COLS,
                            n_hash_features: int = 64) -> Tuple[pd.DataFrame, np.ndarray, FeatureHasher, set]:
-    """
-    Build a training matrix where each row = (signal in a passed log) feature vector.
-    We include hashed signal name to let the model learn per-signal typical ranges.
-    """
     rows = []
     for log in passed_logs:
         if log.features.empty:
@@ -425,7 +417,8 @@ def _build_training_matrix(passed_logs: List[ParsedLog],
 
     # Hash the signal name into a fixed numeric vector
     hasher = FeatureHasher(n_features=n_hash_features, input_type="string", alternate_sign=False)
-    X_sig = hasher.transform(df["signal"].astype(str).tolist()).toarray()
+    signals = df["signal"].astype(str).tolist()
+    X_sig = hasher.transform([[s] for s in signals]).toarray()
 
     # Combine
     X = np.hstack([X_num, X_sig])
@@ -481,17 +474,18 @@ def _score_row_with_model(signal: str,
                           row_features: pd.Series,
                           bundle: PassModelBundle,
                           feature_cols: List[str] = FEATURE_COLS) -> float:
-    """
-    Returns a 0..100 anomaly score for a single signal-row feature vector.
-    """
     x_num = row_features[feature_cols].apply(pd.to_numeric, errors="coerce").fillna(0.0).to_numpy().reshape(1, -1)
-    x_sig = bundle.hasher.transform([str(signal)]).toarray()
+
+    # IMPORTANT: must be iterable of iterables for input_type="string"
+    x_sig = bundle.hasher.transform([[str(signal)]]).toarray()
+
     x = np.hstack([x_num, x_sig])
     xs = bundle.scaler.transform(x)
 
     raw = -bundle.model.score_samples(xs)[0]  # higher => more anomalous
     scaled = 100.0 * (raw - bundle.score_p05) / (bundle.score_p95 - bundle.score_p05)
     return float(np.clip(scaled, 0.0, 100.0))
+
 
 def build_reference_profile(passed_logs: List[ParsedLog]) -> pd.DataFrame:
     all_features = []
@@ -590,7 +584,7 @@ def compare_to_reference(log: ParsedLog, ref: pd.DataFrame) -> pd.DataFrame:
 
         score = float(np.nanmax(scores)) if scores else 0.0
 
-        # Rule-based boosts for common AWD EOL symptoms.
+        # Rule-based boosts for common symptoms.Change as needed.
         rule_boost, rule_reason = rule_based_boost(signal, r)
         score = min(100.0, score * 4.0 + rule_boost)
 
@@ -1047,13 +1041,13 @@ st.set_page_config(
     layout="wide"
 )
 
-st.title("EOL Anomaly Detection & Root Cause Dashboard")
+st.title("Anomaly Detection & Root Cause Dashboard")
 
 st.markdown(
     """
-Upload **passed reference logs** and **failed EOL logs**.  
+Upload **passed reference logs** and **failed logs**.  
 The dashboard parses CANoe-style text logs, builds a passed reference profile,
-detects failed-log divergence, maps likely EOL error codes, and generates a
+detects failed-log divergence, maps likely error codes, and generates a
 simultaneous divergence matrix.
 """
 )
@@ -1130,11 +1124,13 @@ ref_profile = build_reference_profile(passed_logs)
 
 # Train ML model on PASS logs (learn acceptable patterns)
 # You can optionally expose contamination as a UI slider later, but not required.
-pass_model = train_pass_iforest_model(
-    passed_logs,
-    contamination=0.03,  # typical for "mostly normal" training data
-    n_estimators=200
-)
+if "pass_model" not in st.session_state:
+    st.session_state["pass_model"] = train_pass_iforest_model(
+        passed_logs,
+        contamination=0.03,
+        n_estimators=200
+    )
+pass_model = st.session_state["pass_model"]
 
 all_divergence = []
 for log in failed_logs:
@@ -1198,7 +1194,7 @@ Legend: ✅ matches passed reference behavior &nbsp;&nbsp; ❌ divergent from pa
     st.download_button(
         "Download divergence matrix CSV",
         data=csv,
-        file_name="eol_divergence_matrix.csv",
+        file_name="divergence_matrix.csv",
         mime="text/csv"
     )
 
@@ -1218,7 +1214,7 @@ with tab_root:
             f"""
 **Root cause:** {top['probable_root_cause']}  
 **Evidence signal:** `{top['signal']}`  
-**Mapped EOL error:** Bit {top['mapped_error_bit']} — {top['mapped_error_name']}  
+**Mapped error:** Bit {top['mapped_error_bit']} — {top['mapped_error_name']}  
 **Evidence:** {top['evidence']}
 """
         )
@@ -1227,7 +1223,7 @@ with tab_root:
         st.download_button(
             "Download root-cause report CSV",
             data=csv,
-            file_name="eol_root_cause_report.csv",
+            file_name="root_cause_report.csv",
             mime="text/csv"
         )
 
@@ -1259,7 +1255,7 @@ with tab_details:
     st.download_button(
         "Download signal divergence detail CSV",
         data=csv,
-        file_name="eol_signal_divergence_detail.csv",
+        file_name="signal_divergence_detail.csv",
         mime="text/csv"
     )
 
@@ -1281,7 +1277,7 @@ with tab_model:
         st.plotly_chart(fig, use_container_width=True)
 
 with tab_error:
-    st.subheader("AWD EOL Error Code Reference")
+    st.subheader("Error Code Reference")
 
     error_df = pd.DataFrame([
         {
