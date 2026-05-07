@@ -14,8 +14,8 @@ from sklearn.ensemble import IsolationForest
 
 
 # ============================================================
-# EOL Error Code Dictionary
-# Based on provided EOL error-code matrix image.
+# Error Code Dictionary
+# Based on error-code matrix.
 # ============================================================
 
 ERROR_CODES = {
@@ -486,7 +486,7 @@ def compare_to_reference(log: ParsedLog, ref: pd.DataFrame) -> pd.DataFrame:
 
         score = float(np.nanmax(scores)) if scores else 0.0
 
-        # Rule-based boosts for common AWD EOL symptoms.
+        # Rule-based boosts for common AWD symptoms.
         rule_boost, rule_reason = rule_based_boost(signal, r)
         score = min(100.0, score * 4.0 + rule_boost)
 
@@ -854,17 +854,17 @@ def isolation_forest_log_anomaly(all_logs: List[ParsedLog]) -> pd.DataFrame:
 # ============================================================
 
 st.set_page_config(
-    page_title="EOL Divergence Matrix & Root Cause Dashboard",
+    page_title="Divergence Matrix & Root Cause Dashboard",
     layout="wide"
 )
 
-st.title("EOL Anomaly Detection & Root Cause Dashboard")
+st.title("Anomaly Detection & Root Cause Dashboard")
 
 st.markdown(
     """
-Upload **passed reference logs** and **failed EOL logs**.  
+Upload **passed reference logs** and **failed logs**.  
 The dashboard parses CANoe-style text logs, builds a passed reference profile,
-detects failed-log divergence, maps likely EOL error codes, and generates a
+detects failed-log divergence, maps likely error codes, and generates a
 simultaneous divergence matrix.
 """
 )
@@ -1021,7 +1021,7 @@ with tab_root:
             f"""
 **Root cause:** {top['probable_root_cause']}  
 **Evidence signal:** `{top['signal']}`  
-**Mapped EOL error:** Bit {top['mapped_error_bit']} — {top['mapped_error_name']}  
+**Mapped error:** Bit {top['mapped_error_bit']} — {top['mapped_error_name']}  
 **Evidence:** {top['evidence']}
 """
         )
@@ -1030,7 +1030,7 @@ with tab_root:
         st.download_button(
             "Download root-cause report CSV",
             data=csv,
-            file_name="eol_root_cause_report.csv",
+            file_name="root_cause_report.csv",
             mime="text/csv"
         )
 
@@ -1062,7 +1062,7 @@ with tab_details:
     st.download_button(
         "Download signal divergence detail CSV",
         data=csv,
-        file_name="eol_signal_divergence_detail.csv",
+        file_name="signal_divergence_detail.csv",
         mime="text/csv"
     )
 
@@ -1084,7 +1084,7 @@ with tab_model:
         st.plotly_chart(fig, use_container_width=True)
 
 with tab_error:
-    st.subheader("AWD EOL Error Code Reference")
+    st.subheader("Error Code Reference")
 
     error_df = pd.DataFrame([
         {
