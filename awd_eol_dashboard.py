@@ -14,14 +14,14 @@ from sklearn.ensemble import IsolationForest
 
 
 # ============================================================
-# AWD EOL Error Code Dictionary
-# Based on provided EOL AWD error-code matrix image.
+# EOL Error Code Dictionary
+# Based on provided EOL error-code matrix image.
 # ============================================================
 
 ERROR_CODES = {
     0: {
         "status_value": "2^0",
-        "name": "ETM Error Status detected",
+        "name": "Error Status detected",
         "description": "ETM Error Status detected; check V_ETM_Disturbance_Status for more error information.",
         "root_hint": "ETM internal diagnostic or disturbance status."
     },
@@ -592,7 +592,7 @@ ROOT_CAUSE_RULES = [
         "interpretation": "CAN controller or network status reports error active."
     },
     {
-        "pattern": ["gkn_hil.panel"],
+        "pattern": ["hil.panel"],
         "error_bits": [7, 20, 21],
         "root_cause": "Rig/HIL motion inputs are static or missing",
         "interpretation": "Panel acceleration/yaw/steering inputs remain static; may explain run-in energy failure."
@@ -687,7 +687,7 @@ BEHAVIOR_GROUPS = {
     "Wheel speed auth": ["wheelspeeds", "angvelauth"],
     "Wheel speed invalid flags": ["wheelspeeds", "_inv"],
     "Wheel speeds / motion inputs": ["flspeed", "frspeed", "speed"],
-    "GKN HIL motion panel": ["gkn_hil.panel"],
+    "HIL motion panel": ["hil.panel"],
     "CAN / CAN-FD health": ["can"],
     "Software / config": ["version", "config", "mact"],
     "Diagnostics / service": ["diag", "diagnostic", "dtc", "negative", "request"],
@@ -710,7 +710,7 @@ def behavior_for_signal(signal: str) -> str:
     if "ign" in s:
         return "Ignition / RBS"
     if "gkn_hil" in s:
-        return "GKN HIL motion panel"
+        return "HIL motion panel"
     return "Other signals"
 
 
@@ -854,17 +854,17 @@ def isolation_forest_log_anomaly(all_logs: List[ParsedLog]) -> pd.DataFrame:
 # ============================================================
 
 st.set_page_config(
-    page_title="AWD EOL Divergence Matrix & Root Cause Dashboard",
+    page_title="EOL Divergence Matrix & Root Cause Dashboard",
     layout="wide"
 )
 
-st.title("AWD EOL Anomaly Detection & Root Cause Dashboard")
+st.title("EOL Anomaly Detection & Root Cause Dashboard")
 
 st.markdown(
     """
 Upload **passed reference logs** and **failed EOL logs**.  
 The dashboard parses CANoe-style text logs, builds a passed reference profile,
-detects failed-log divergence, maps likely AWD EOL error codes, and generates a
+detects failed-log divergence, maps likely EOL error codes, and generates a
 simultaneous divergence matrix.
 """
 )
@@ -1001,7 +1001,7 @@ Legend: ✅ matches passed reference behavior &nbsp;&nbsp; ❌ divergent from pa
     st.download_button(
         "Download divergence matrix CSV",
         data=csv,
-        file_name="awd_eol_divergence_matrix.csv",
+        file_name="eol_divergence_matrix.csv",
         mime="text/csv"
     )
 
@@ -1030,7 +1030,7 @@ with tab_root:
         st.download_button(
             "Download root-cause report CSV",
             data=csv,
-            file_name="awd_eol_root_cause_report.csv",
+            file_name="eol_root_cause_report.csv",
             mime="text/csv"
         )
 
@@ -1062,7 +1062,7 @@ with tab_details:
     st.download_button(
         "Download signal divergence detail CSV",
         data=csv,
-        file_name="awd_eol_signal_divergence_detail.csv",
+        file_name="eol_signal_divergence_detail.csv",
         mime="text/csv"
     )
 
