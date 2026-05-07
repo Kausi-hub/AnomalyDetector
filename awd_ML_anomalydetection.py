@@ -15,8 +15,8 @@ from sklearn.preprocessing import StandardScaler
 from sklearn.feature_extraction import FeatureHasher
 
 # ============================================================
-# EOL Error Code Dictionary
-# Based on provided EOL error-code matrix image.
+# Error Code Dictionary
+# Based on provided error-cod matrix.
 # ============================================================
 
 ERROR_CODES = {
