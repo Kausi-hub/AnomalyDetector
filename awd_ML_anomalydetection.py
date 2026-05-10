@@ -3,7 +3,7 @@ import io
 import math
 import json
 from dataclasses import dataclass
-from typing import Dict, List, Tuple, Optional
+from typing import Dict, List, Tuple, Optional, Union
 
 import numpy as np
 import pandas as pd
@@ -14,11 +14,61 @@ from sklearn.ensemble import IsolationForest
 from sklearn.preprocessing import StandardScaler
 from sklearn.feature_extraction import FeatureHasher
 
-# ============================================================
-# Error Code Dictionary
-# Based on provided error-cod matrix.
-# ============================================================
+# Constants
+ENCODINGS = ["utf-8", "latin-1", "cp1252"]
+DEFAULT_CONTAMINATION = 0.03
+DEFAULT_N_ESTIMATORS = 200
+RANDOM_STATE = 42
+HASH_FEATURES = 64
+HIGH_THRESHOLD_DEFAULT = 60
+WARN_THRESHOLD_DEFAULT = 25
+TOP_ROOT_CAUSES_DEFAULT = 8
 
+# Feature columns for analysis
+FEATURE_COLS = [
+    "count", "numeric_count", "last", "mean", "std", "min", "max", "span",
+    "zero_frac", "one_frac", "nonzero_frac", "unique_count",
+    "transitions", "duration", "event_rate_hz", "first_seen", "last_seen"
+]
+
+# Behavior groups for signal categorization
+BEHAVIOR_GROUPS = {
+    "Ignition / RBS": ["ignition", "ign_txing", "rbs"],
+    "Wheel speed auth": ["wheelspeeds", "angvelauth"],
+    "Wheel speed invalid flags": ["wheelspeeds", "_inv"],
+    "Wheel speeds / motion inputs": ["flspeed", "frspeed", "speed"],
+    "HIL motion panel": ["hil.panel"],
+    "CAN / CAN-FD health": ["can"],
+    "Software / config": ["version", "config", "mact"],
+    "Diagnostics / service": ["diag", "diagnostic", "dtc", "negative", "request"],
+    "Torque / clutch / calibration": ["torque", "clutch", "cwod", "cwo", "classification"],
+    "EEPROM / NVM": ["eeprom", "nvm"],
+}
+
+@dataclass
+class PassModelBundle:
+    """Container for trained anomaly detection model components."""
+    scaler: StandardScaler
+    model: IsolationForest
+    hasher: FeatureHasher
+    score_p05: float
+    score_p95: float
+    pass_signal_set: set
+
+
+@dataclass
+class ParsedLog:
+    """Container for parsed log data and metadata."""
+    name: str
+    label: str
+    raw_text: str
+    events: pd.DataFrame
+    features: pd.DataFrame
+    metadata: Dict[str, str]
+
+
+# Error Code Dictionary
+# Based on provided error-code matrix.
 ERROR_CODES = {
     0: {
         "status_value": "2^0",
@@ -124,7 +174,7 @@ ERROR_CODES = {
     },
     17: {
         "status_value": "2^17",
-        "name": "Classification Values Don’t match between Rig and ECU",
+        "name": "Classification Values Don't match between Rig and ECU",
         "description": "Classification values in Rig-EOL-SW do not match ECU EEPROM classification values.",
         "root_hint": "Rig/ECU calibration or classification mismatch."
     },
@@ -171,31 +221,83 @@ ERROR_CODES = {
         "root_hint": "EEPROM write/readback mismatch."
     },
 }
-# ============================================================
-# Parsing
-# ============================================================
 
-@dataclass
-class ParsedLog:
-    name: str
-    label: str
-    raw_text: str
-    events: pd.DataFrame
-    features: pd.DataFrame
-    metadata: Dict[str, str]
+# Root cause rules for mapping signals to error codes
+ROOT_CAUSE_RULES = [
+    {
+        "pattern": ["wheel", "_inv"],
+        "error_bits": [13, 21, 23],
+        "root_cause": "Wheel-speed validity/authentication issue or missing vehicle motion input",
+        "interpretation": "Wheel-speed inverted/auth invalid flags diverge from passed reference."
+    },
+    {
+        "pattern": ["angvelauth"],
+        "error_bits": [13, 21, 23],
+        "root_cause": "Wheel-speed authentication not valid",
+        "interpretation": "Wheel angular velocity authorization remains invalid or zero."
+    },
+    {
+        "pattern": ["ign_txing_rbs_msgs"],
+        "error_bits": [13, 21],
+        "root_cause": "RBS transmit gating instability",
+        "interpretation": "RBS messages drop/toggle relative to passed reference; often symptom, not root cause."
+    },
+    {
+        "pattern": ["can", "status"],
+        "error_bits": [13, 23],
+        "root_cause": "CAN/CAN-FD communication disturbance",
+        "interpretation": "CAN controller or network status reports error active."
+    },
+    {
+        "pattern": ["hil.panel"],
+        "error_bits": [7, 20, 21],
+        "root_cause": "Rig/HIL motion inputs are static or missing",
+        "interpretation": "Panel acceleration/yaw/steering inputs remain static; may explain run-in energy failure."
+    },
+    {
+        "pattern": ["diagnostic", "negative"],
+        "error_bits": [14],
+        "root_cause": "ECU rejected diagnostic/device-control request",
+        "interpretation": "Diagnostic service negative response or device-control request rejected."
+    },
+    {
+        "pattern": ["cwod"],
+        "error_bits": [14, 22],
+        "root_cause": "CWOD calibration request rejected or calibration condition not met",
+        "interpretation": "CWOD-specific request/calibration issue."
+    },
+    {
+        "pattern": ["eeprom"],
+        "error_bits": [17, 24],
+        "root_cause": "EEPROM/classification readback mismatch",
+        "interpretation": "Stored ECU values differ from expected rig/classification values."
+    },
+    {
+        "pattern": ["torque"],
+        "error_bits": [3, 11, 18],
+        "root_cause": "Torque limit or torque verification mismatch",
+        "interpretation": "Torque measurement, command, or verification behavior diverges."
+    },
+]
 
+
+# ============================================================
+# Parsing Functions
+# ============================================================
 
 def read_uploaded_file(uploaded_file) -> str:
+    """Read uploaded file content with multiple encoding fallbacks."""
     data = uploaded_file.read()
-    for enc in ["utf-8", "latin-1", "cp1252"]:
+    for encoding in ENCODINGS:
         try:
-            return data.decode(enc)
+            return data.decode(encoding)
         except UnicodeDecodeError:
             continue
     return data.decode("utf-8", errors="ignore")
 
 
 def normalize_signal_name(name: str) -> str:
+    """Normalize signal names for consistent processing."""
     name = name.strip()
     name = name.replace("\\_", "_")
     name = name.replace("::", ".")
@@ -203,35 +305,28 @@ def normalize_signal_name(name: str) -> str:
     return name
 
 
-def parse_value(value_str: str):
+def parse_value(value_str: str) -> Union[float, str, np.float64]:
+    """Parse string values into appropriate numeric or string types."""
     value_str = value_str.strip().strip('"')
     if value_str == "":
         return np.nan
 
-    # Hex-ish payloads, arrays, text statuses remain strings.
+    # Keep arrays and hex payloads as strings
     if "[" in value_str or "]" in value_str:
         return value_str
 
-    # Numeric conversion.
+    # Attempt numeric conversion
     try:
         if re.match(r"^-?\d+(\.\d+)?$", value_str):
             return float(value_str)
     except Exception:
         pass
 
-    # Common ready/status text.
     return value_str
 
 
-def parse_log_text(text: str, name: str, label: str) -> ParsedLog:
-    """
-    Supports common patterns in the attached CANoe-style text logs:
-      0.000000 Signal := value
-      0.000000 SV: ... ::Namespace::Signal = value
-      0.020091 CAN 1 Status:chip status error active
-      0.079818 CANFD 1 Tx ...
-    """
-    rows = []
+def extract_metadata(text: str) -> Dict[str, str]:
+    """Extract metadata from log file comments."""
     metadata = {}
 
     version_match = re.search(r"//\s*version\s+([^\n\r]+)", text)
@@ -245,61 +340,110 @@ def parse_log_text(text: str, name: str, label: str) -> ParsedLog:
     if date_match:
         metadata["date"] = date_match.group(1).strip()
 
-    line_pattern = re.compile(r"^\s*(\d+\.\d+)\s+(.*)$")
-    assign_pattern = re.compile(r"^([A-Za-z0-9_:\\.\-\[\]/]+)\s*:=\s*(.*)$")
+    return metadata
+
+
+def parse_sv_signal(payload: str) -> Optional[Dict]:
+    """Parse SV (System Variable) style signals."""
     sv_pattern = re.compile(r"^SV:\s+.*?(::[A-Za-z0-9_:]+)\s*=\s*(.*)$")
+    sv_match = sv_pattern.match(payload)
+    if sv_match:
+        signal = normalize_signal_name(sv_match.group(1).lstrip(":"))
+        value = parse_value(sv_match.group(2))
+        return {
+            "signal": signal,
+            "value": value,
+            "event_type": "SV"
+        }
+    return None
+
+
+def parse_assign_signal(payload: str) -> Optional[Dict]:
+    """Parse assignment-style signals (signal := value)."""
+    assign_pattern = re.compile(r"^([A-Za-z0-9_:\\.\-\[\]/]+)\s*:=\s*(.*)$")
+    assign_match = assign_pattern.match(payload)
+    if assign_match:
+        signal = normalize_signal_name(assign_match.group(1))
+        value = parse_value(assign_match.group(2))
+        return {
+            "signal": signal,
+            "value": value,
+            "event_type": "ASSIGN"
+        }
+    return None
+
+
+def parse_can_status(payload: str) -> Optional[Dict]:
+    """Parse CAN status messages."""
     can_status_pattern = re.compile(r"^(CAN(?:FD)?\s+\d+)\s+Status:(.*)$", re.IGNORECASE)
+    can_match = can_status_pattern.match(payload)
+    if can_match:
+        signal = normalize_signal_name(can_match.group(1) + "_Status")
+        value = can_match.group(2).strip()
+        return {
+            "signal": signal,
+            "value": value,
+            "event_type": "CAN_STATUS"
+        }
+    return None
+
+
+def parse_can_frame(payload: str) -> Optional[Dict]:
+    """Parse CAN frame transmissions."""
     can_tx_pattern = re.compile(r"^(CANFD|CAN)\s+(\d+)\s+(Tx|Rx)\s+([0-9A-Fa-fx]+)\s+([A-Za-z0-9_]+)?\s*(.*)$")
+    can_match = can_tx_pattern.match(payload)
+    if can_match:
+        bus_type, channel, direction, can_id, pdu, rest = can_match.groups()
+        signal = normalize_signal_name(f"{bus_type}{channel}_{direction}_{pdu or can_id}")
+        return {
+            "signal": signal,
+            "value": 1.0,
+            "event_type": "CAN_FRAME"
+        }
+    return None
+
+
+def parse_log_line(line: str) -> Optional[Dict]:
+    """Parse a single log line and extract signal data."""
+    line_pattern = re.compile(r"^\s*(\d+\.\d+)\s+(.*)$")
+    match = line_pattern.match(line)
+    if not match:
+        return None
+
+    timestamp = float(match.group(1))
+    payload = match.group(2).strip()
+
+    # Try different parsing strategies
+    parsers = [parse_sv_signal, parse_assign_signal, parse_can_status, parse_can_frame]
+    for parser in parsers:
+        result = parser(payload)
+        if result:
+            result["time"] = timestamp
+            result["raw"] = line
+            return result
+
+    return None
+
+
+def parse_log_text(text: str, name: str, label: str) -> ParsedLog:
+    """
+    Parse CANoe-style text logs into structured data.
+
+    Supports multiple log formats:
+    - Signal assignments: signal := value
+    - SV variables: SV: ... ::Signal = value
+    - CAN status: CAN 1 Status: message
+    - CAN frames: CANFD 1 Tx/Rx ...
+    """
+    events_data = []
+    metadata = extract_metadata(text)
 
     for line in text.splitlines():
-        m = line_pattern.match(line)
-        if not m:
-            continue
+        parsed_line = parse_log_line(line)
+        if parsed_line:
+            events_data.append(parsed_line)
 
-        t = float(m.group(1))
-        payload = m.group(2).strip()
-
-        sv = sv_pattern.match(payload)
-        if sv:
-            signal = normalize_signal_name(sv.group(1).lstrip(":"))
-            value = parse_value(sv.group(2))
-            rows.append({
-                "time": t, "signal": signal, "value": value,
-                "event_type": "SV", "raw": line
-            })
-            continue
-
-        assign = assign_pattern.match(payload)
-        if assign:
-            signal = normalize_signal_name(assign.group(1))
-            value = parse_value(assign.group(2))
-            rows.append({
-                "time": t, "signal": signal, "value": value,
-                "event_type": "ASSIGN", "raw": line
-            })
-            continue
-
-        can_status = can_status_pattern.match(payload)
-        if can_status:
-            signal = normalize_signal_name(can_status.group(1) + "_Status")
-            value = can_status.group(2).strip()
-            rows.append({
-                "time": t, "signal": signal, "value": value,
-                "event_type": "CAN_STATUS", "raw": line
-            })
-            continue
-
-        can_tx = can_tx_pattern.match(payload)
-        if can_tx:
-            bus_type, channel, direction, can_id, pdu, rest = can_tx.groups()
-            signal = normalize_signal_name(f"{bus_type}{channel}_{direction}_{pdu or can_id}")
-            rows.append({
-                "time": t, "signal": signal, "value": 1.0,
-                "event_type": "CAN_FRAME", "raw": line
-            })
-            continue
-
-    events = pd.DataFrame(rows)
+    events = pd.DataFrame(events_data)
 
     if events.empty:
         features = pd.DataFrame()
@@ -312,10 +456,12 @@ def parse_log_text(text: str, name: str, label: str) -> ParsedLog:
 
 
 def to_numeric_series(series: pd.Series) -> pd.Series:
+    """Convert series to numeric, handling errors gracefully."""
     return pd.to_numeric(series, errors="coerce")
 
 
 def compute_features(events: pd.DataFrame) -> pd.DataFrame:
+    """Compute statistical features for each signal from event data."""
     feature_rows = []
 
     for signal, grp in events.groupby("signal"):
@@ -377,29 +523,9 @@ def compute_features(events: pd.DataFrame) -> pd.DataFrame:
     return pd.DataFrame(feature_rows)
 
 
-# ============================================================
-# Reference profile and anomaly scoring
-# ============================================================
-
-FEATURE_COLS = [
-    "count", "numeric_count", "last", "mean", "std", "min", "max", "span",
-    "zero_frac", "one_frac", "nonzero_frac", "unique_count",
-    "transitions", "duration", "event_rate_hz", "first_seen", "last_seen"
-]
-
-@dataclass
-class PassModelBundle:
-    scaler: StandardScaler
-    model: IsolationForest
-    hasher: FeatureHasher
-    score_p05: float
-    score_p95: float
-    pass_signal_set: set
-
-
 def _build_training_matrix(passed_logs: List[ParsedLog],
                            feature_cols: List[str] = FEATURE_COLS,
-                           n_hash_features: int = 64) -> Tuple[pd.DataFrame, np.ndarray, FeatureHasher, set]:
+                           n_hash_features: int = HASH_FEATURES) -> Tuple[pd.DataFrame, np.ndarray, FeatureHasher, set]:
     rows = []
     for log in passed_logs:
         if log.features.empty:
@@ -428,16 +554,25 @@ def _build_training_matrix(passed_logs: List[ParsedLog],
 
 
 def train_pass_iforest_model(passed_logs: List[ParsedLog],
-                             contamination: float = 0.03,
-                             n_estimators: int = 200,
-                             random_state: int = 42) -> PassModelBundle:
+                             contamination: float = DEFAULT_CONTAMINATION,
+                             n_estimators: int = DEFAULT_N_ESTIMATORS,
+                             random_state: int = RANDOM_STATE) -> PassModelBundle:
     """
-    Train an IsolationForest on PASS signal-level feature rows.
+    Train an IsolationForest model on passed log data for anomaly detection.
+
+    Args:
+        passed_logs: List of successfully parsed logs
+        contamination: Expected proportion of outliers in training data
+        n_estimators: Number of trees in the forest
+        random_state: Random seed for reproducibility
+
+    Returns:
+        Trained model bundle with scaler, model, hasher, and score thresholds
     """
     df_train, X_train, hasher, pass_signal_set = _build_training_matrix(passed_logs)
 
     if X_train.size == 0:
-        # Fallback empty model bundle (won't score anything)
+        # Fallback empty model bundle for edge cases
         scaler = StandardScaler()
         model = IsolationForest(random_state=random_state)
         return PassModelBundle(scaler, model, hasher, 0.0, 1.0, pass_signal_set)
@@ -452,8 +587,7 @@ def train_pass_iforest_model(passed_logs: List[ParsedLog],
     )
     model.fit(Xs)
 
-    # Use training score distribution to scale scores to 0..100
-    # Higher = more anomalous
+    # Scale scores to 0-100 range using training distribution percentiles
     train_scores = -model.score_samples(Xs)
     p05 = float(np.percentile(train_scores, 5))
     p95 = float(np.percentile(train_scores, 95))
@@ -474,20 +608,27 @@ def _score_row_with_model(signal: str,
                           row_features: pd.Series,
                           bundle: PassModelBundle,
                           feature_cols: List[str] = FEATURE_COLS) -> float:
+    """Score a signal's features using the trained anomaly detection model."""
+    # Extract numeric features
     x_num = row_features[feature_cols].apply(pd.to_numeric, errors="coerce").fillna(0.0).to_numpy().reshape(1, -1)
 
-    # IMPORTANT: must be iterable of iterables for input_type="string"
+    # Hash the signal name for categorical feature
     x_sig = bundle.hasher.transform([[str(signal)]]).toarray()
 
+    # Combine features and scale
     x = np.hstack([x_num, x_sig])
     xs = bundle.scaler.transform(x)
 
-    raw = -bundle.model.score_samples(xs)[0]  # higher => more anomalous
-    scaled = 100.0 * (raw - bundle.score_p05) / (bundle.score_p95 - bundle.score_p05)
-    return float(np.clip(scaled, 0.0, 100.0))
+    # Get anomaly score (higher = more anomalous)
+    raw_score = -bundle.model.score_samples(xs)[0]
+
+    # Scale to 0-100 range using training distribution
+    scaled_score = 100.0 * (raw_score - bundle.score_p05) / (bundle.score_p95 - bundle.score_p05)
+    return float(np.clip(scaled_score, 0.0, 100.0))
 
 
 def build_reference_profile(passed_logs: List[ParsedLog]) -> pd.DataFrame:
+    """Build a statistical reference profile from passed logs."""
     all_features = []
     for log in passed_logs:
         f = log.features.copy()
@@ -513,7 +654,7 @@ def build_reference_profile(passed_logs: List[ParsedLog]) -> pd.DataFrame:
                 row[f"{col}_ref_max"] = np.nan
             else:
                 median = vals.median()
-                mad = np.median(np.abs(vals - median))
+                mad = np.median(np.abs(vals - median))  # Median Absolute Deviation
                 row[f"{col}_ref_median"] = median
                 row[f"{col}_ref_mad"] = mad
                 row[f"{col}_ref_min"] = vals.min()
@@ -523,29 +664,61 @@ def build_reference_profile(passed_logs: List[ParsedLog]) -> pd.DataFrame:
     return pd.DataFrame(profile_rows)
 
 
-def robust_z(value, median, mad):
+def robust_z(value: float, median: float, mad: float) -> float:
+    """Calculate robust Z-score using median and MAD (Median Absolute Deviation)."""
     if pd.isna(value) or pd.isna(median):
         return np.nan
-    scale = 1.4826 * mad
+    scale = 1.4826 * mad  # Scale factor for MAD to be consistent with std
     if pd.isna(scale) or scale < 1e-9:
         return 0.0 if abs(value - median) < 1e-9 else abs(value - median)
     return abs(value - median) / scale
 
 
+def calculate_divergence_score(feature_vals: pd.Series, ref_median: float, ref_mad: float) -> Tuple[float, List[str]]:
+    """Calculate divergence score and collect reasons for a feature set."""
+    scores = []
+    reasons = []
+
+    for col in FEATURE_COLS:
+        val = pd.to_numeric(pd.Series([feature_vals.get(col)]), errors="coerce").iloc[0]
+        med = ref_median.get(f"{col}_ref_median", np.nan) if isinstance(ref_median, pd.Series) else np.nan
+        mad = ref_mad.get(f"{col}_ref_mad", np.nan) if isinstance(ref_mad, pd.Series) else np.nan
+
+        z = robust_z(val, med, mad)
+        if not pd.isna(z):
+            scores.append(min(z, 25.0))
+
+            if z >= 6:
+                reasons.append(f"{col} deviates strongly")
+            elif z >= 3:
+                reasons.append(f"{col} deviates")
+
+    score = float(np.nanmax(scores)) if scores else 0.0
+    return score, reasons
+
+
+def determine_status_and_severity(score: float) -> Tuple[str, str]:
+    """Determine status emoji and severity level based on divergence score."""
+    if score >= HIGH_THRESHOLD_DEFAULT:
+        return "❌", "High"
+    elif score >= WARN_THRESHOLD_DEFAULT:
+        return "⚠️", "Medium"
+    else:
+        return "✅", "Low"
+
+
 def compare_to_reference(log: ParsedLog, ref: pd.DataFrame) -> pd.DataFrame:
+    """Compare log features to reference profile and identify divergences."""
     if log.features.empty or ref.empty:
         return pd.DataFrame()
 
     merged = log.features.merge(ref, on="signal", how="outer", indicator=True)
-
     rows = []
+
     for _, r in merged.iterrows():
         signal = r["signal"]
         missing_in_failed = r["_merge"] == "right_only"
         new_in_failed = r["_merge"] == "left_only"
-
-        scores = []
-        reasons = []
 
         if missing_in_failed:
             rows.append({
@@ -569,38 +742,16 @@ def compare_to_reference(log: ParsedLog, ref: pd.DataFrame) -> pd.DataFrame:
             })
             continue
 
-        for col in FEATURE_COLS:
-            val = pd.to_numeric(pd.Series([r.get(col)]), errors="coerce").iloc[0]
-            med = r.get(f"{col}_ref_median", np.nan)
-            mad = r.get(f"{col}_ref_mad", np.nan)
-            z = robust_z(val, med, mad)
-            if not pd.isna(z):
-                scores.append(min(z, 25.0))
+        # Calculate divergence for common signals
+        score, reasons = calculate_divergence_score(r, r, r)  # ref data is in the same row
 
-                if z >= 6:
-                    reasons.append(f"{col} deviates strongly")
-                elif z >= 3:
-                    reasons.append(f"{col} deviates")
-
-        score = float(np.nanmax(scores)) if scores else 0.0
-
-        # Rule-based boosts for common symptoms.Change as needed.
-        rule_boost, rule_reason = rule_based_boost(signal, r)
+        # Apply rule-based boosts
+        rule_boost, rule_reasons = rule_based_boost(signal, r)
         score = min(100.0, score * 4.0 + rule_boost)
+        reasons.extend(rule_reasons)
 
-        reason = "; ".join(sorted(set(reasons + rule_reason)))
-        if not reason:
-            reason = "Matches passed reference behavior"
-
-        if score >= 60:
-            status = "❌"
-            severity = "High"
-        elif score >= 25:
-            status = "⚠️"
-            severity = "Medium"
-        else:
-            status = "✅"
-            severity = "Low"
+        reason = "; ".join(sorted(set(reasons))) if reasons else "Matches passed reference behavior"
+        status, severity = determine_status_and_severity(score)
 
         rows.append({
             "log_name": log.name,
@@ -618,76 +769,55 @@ def compare_to_pass_model(log: ParsedLog,
                           bundle: PassModelBundle,
                           feature_cols: List[str] = FEATURE_COLS) -> pd.DataFrame:
     """
+    Compare log to ML model trained on passed logs.
+
     Produces the same output schema as compare_to_reference(),
-    but divergence_score is ML-based (trained on PASS).
-    Keeps the missing/new signal logic.
-    Uses the reference profile only for human-readable reasons.
+    but uses ML-based anomaly scoring instead of statistical comparison.
     """
     if log.features.empty:
         return pd.DataFrame()
 
-    # If you still want missing/new handling, we need reference signal set.
     ref_signals = set(ref["signal"].astype(str).unique()) if not ref.empty else set()
     fail_signals = set(log.features["signal"].astype(str).unique())
-
     rows = []
 
-    # 1) Missing in failed (present in PASS ref but not in FAIL)
-    for s in sorted(ref_signals - fail_signals):
+    # Handle missing signals (present in PASS ref but not in FAIL)
+    for signal in sorted(ref_signals - fail_signals):
         rows.append({
             "log_name": log.name,
-            "signal": s,
+            "signal": signal,
             "divergence_score": 100.0,
             "status": "❌",
             "reason": "Signal exists in passed reference but is missing in failed log",
             "severity": "High"
         })
 
-    # 2) New in failed (present in FAIL but not in PASS ref)
-    for s in sorted(fail_signals - ref_signals):
+    # Handle new signals (present in FAIL but not in PASS ref)
+    for signal in sorted(fail_signals - ref_signals):
         rows.append({
             "log_name": log.name,
-            "signal": s,
+            "signal": signal,
             "divergence_score": 75.0,
             "status": "⚠️",
             "reason": "Signal appears in failed log but not in passed reference",
             "severity": "Medium"
         })
 
-    # 3) Common signals: ML anomaly scoring per signal-row
-    common = log.features[log.features["signal"].isin(ref_signals)].copy() if ref_signals else log.features.copy()
+    # Score common signals using ML model
+    common_signals = log.features[log.features["signal"].isin(ref_signals)].copy() if ref_signals else log.features.copy()
+    merged = common_signals.merge(ref, on="signal", how="left") if not ref.empty else common_signals
 
-    # For interpretability: join reference medians/mads (optional)
-    merged = common.merge(ref, on="signal", how="left")
+    for _, row in merged.iterrows():
+        signal = row["signal"]
 
-    for _, r in merged.iterrows():
-        signal = r["signal"]
+        # Get ML anomaly score
+        score = _score_row_with_model(signal, row, bundle, feature_cols=feature_cols)
 
-        # ML score
-        score = _score_row_with_model(signal, r, bundle, feature_cols=feature_cols)
-
-        # Explain using top deviating feature_cols (based on your ref profile)
-        reasons = []
-        for col in feature_cols:
-            val = pd.to_numeric(pd.Series([r.get(col)]), errors="coerce").iloc[0]
-            med = r.get(f"{col}_ref_median", np.nan)
-            mad = r.get(f"{col}_ref_mad", np.nan)
-            z = robust_z(val, med, mad)
-            if not pd.isna(z):
-                if z >= 6:
-                    reasons.append(f"{col} deviates strongly")
-                elif z >= 3:
-                    reasons.append(f"{col} deviates")
-
+        # Generate human-readable reasons based on reference profile
+        _, reasons = calculate_divergence_score(row, row, row)
         reason = "; ".join(sorted(set(reasons))) if reasons else "Matches passed reference behavior"
 
-        # Map severity/status using the same cutoffs you already apply later
-        if score >= 60:
-            status, severity = "❌", "High"
-        elif score >= 25:
-            status, severity = "⚠️", "Medium"
-        else:
-            status, severity = "✅", "Low"
+        status, severity = determine_status_and_severity(score)
 
         rows.append({
             "log_name": log.name,
@@ -700,45 +830,51 @@ def compare_to_pass_model(log: ParsedLog,
 
     return pd.DataFrame(rows)
 def rule_based_boost(signal: str, row: pd.Series) -> Tuple[float, List[str]]:
+    """Apply rule-based boosts for known problematic signal patterns."""
     boost = 0.0
     reasons = []
 
-    last = pd.to_numeric(pd.Series([row.get("last")]), errors="coerce").iloc[0]
-    mean = pd.to_numeric(pd.Series([row.get("mean")]), errors="coerce").iloc[0]
-    span = pd.to_numeric(pd.Series([row.get("span")]), errors="coerce").iloc[0]
-    zero_frac = pd.to_numeric(pd.Series([row.get("zero_frac")]), errors="coerce").iloc[0]
-    one_frac = pd.to_numeric(pd.Series([row.get("one_frac")]), errors="coerce").iloc[0]
-    transitions = pd.to_numeric(pd.Series([row.get("transitions")]), errors="coerce").iloc[0]
+    # Extract numeric features safely
+    features = {}
+    for feat in ["last", "mean", "span", "zero_frac", "one_frac", "transitions"]:
+        features[feat] = pd.to_numeric(pd.Series([row.get(feat)]), errors="coerce").iloc[0]
 
     s = signal.lower()
 
-    if "_inv" in s and not pd.isna(one_frac) and one_frac > 0.8:
+    # Rule 1: Inverted/auth invalid flags persistently high
+    if "_inv" in s and not pd.isna(features["one_frac"]) and features["one_frac"] > 0.8:
         boost += 45
         reasons.append("inverted/auth invalid flag is persistently high")
 
-    if "angvelauth" in s and not pd.isna(zero_frac) and zero_frac > 0.8:
+    # Rule 2: Wheel angular velocity auth remains invalid/zero
+    if "angvelauth" in s and not pd.isna(features["zero_frac"]) and features["zero_frac"] > 0.8:
         boost += 25
         reasons.append("wheel angular velocity auth remains invalid/zero")
 
-    if ("flspeed" in s or "frspeed" in s or "speed" in s) and not pd.isna(zero_frac) and zero_frac > 0.95:
+    # Rule 3: Speed signals remain zero/static
+    if any(speed in s for speed in ["flspeed", "frspeed", "speed"]) and not pd.isna(features["zero_frac"]) and features["zero_frac"] > 0.95:
         boost += 15
         reasons.append("speed remains zero/static")
 
-    if "gkn_hil.panel" in s and not pd.isna(zero_frac) and zero_frac > 0.95:
+    # Rule 4: HIL motion input remains static zero
+    if "gkn_hil.panel" in s and not pd.isna(features["zero_frac"]) and features["zero_frac"] > 0.95:
         boost += 10
         reasons.append("HIL motion input remains static zero")
 
-    if "ign_txing_rbs_msgs" in s and not pd.isna(transitions) and transitions > 10:
+    # Rule 5: RBS message transmission is unstable/toggling
+    if "ign_txing_rbs_msgs" in s and not pd.isna(features["transitions"]) and features["transitions"] > 10:
         boost += 20
         reasons.append("RBS message transmission is unstable/toggling")
 
+    # Rule 6: CAN status reports error
     if "can" in s and "status" in s:
-        raw_value = str(row.get("last", ""))
-        if "error" in raw_value.lower():
+        raw_value = str(row.get("last", "")).lower()
+        if "error" in raw_value:
             boost += 35
             reasons.append("CAN status reports error active")
 
-    if not pd.isna(span) and span == 0 and not pd.isna(zero_frac) and zero_frac > 0.95:
+    # Rule 7: Signal is stuck at zero
+    if not pd.isna(features["span"]) and features["span"] == 0 and not pd.isna(features["zero_frac"]) and features["zero_frac"] > 0.95:
         boost += 5
         reasons.append("signal is stuck at zero")
 
@@ -807,55 +943,60 @@ ROOT_CAUSE_RULES = [
 ]
 
 
-def identify_root_causes(divergence_df: pd.DataFrame, top_n: int = 8) -> pd.DataFrame:
+def identify_root_causes(divergence_df: pd.DataFrame, top_n: int = TOP_ROOT_CAUSES_DEFAULT) -> pd.DataFrame:
+    """Identify probable root causes by mapping high-divergence signals to error codes."""
     if divergence_df.empty:
         return pd.DataFrame()
 
-    high = divergence_df.sort_values("divergence_score", ascending=False).head(50)
-    root_rows = []
+    # Focus on top 50 highest-scoring signals for efficiency
+    high_divergence_signals = divergence_df.sort_values("divergence_score", ascending=False).head(50)
+    root_cause_rows = []
 
-    for _, r in high.iterrows():
-        signal = str(r["signal"]).lower()
+    for _, row in high_divergence_signals.iterrows():
+        signal = str(row["signal"]).lower()
         matched = False
 
+        # Check against predefined root cause rules
         for rule in ROOT_CAUSE_RULES:
-            if all(p in signal for p in rule["pattern"]):
-                for bit in rule["error_bits"]:
-                    ec = ERROR_CODES.get(bit, {})
-                    root_rows.append({
-                        "log_name": r["log_name"],
-                        "signal": r["signal"],
-                        "divergence_score": r["divergence_score"],
-                        "status": r["status"],
+            if all(pattern in signal for pattern in rule["pattern"]):
+                for error_bit in rule["error_bits"]:
+                    error_info = ERROR_CODES.get(error_bit, {})
+                    root_cause_rows.append({
+                        "log_name": row["log_name"],
+                        "signal": row["signal"],
+                        "divergence_score": row["divergence_score"],
+                        "status": row["status"],
                         "probable_root_cause": rule["root_cause"],
                         "interpretation": rule["interpretation"],
-                        "mapped_error_bit": bit,
-                        "mapped_error_name": ec.get("name", ""),
-                        "mapped_error_status_value": ec.get("status_value", ""),
-                        "error_description": ec.get("description", ""),
-                        "evidence": r["reason"],
+                        "mapped_error_bit": error_bit,
+                        "mapped_error_name": error_info.get("name", ""),
+                        "mapped_error_status_value": error_info.get("status_value", ""),
+                        "error_description": error_info.get("description", ""),
+                        "evidence": row["reason"],
                     })
                 matched = True
 
-        if not matched and r["divergence_score"] >= 60:
-            root_rows.append({
-                "log_name": r["log_name"],
-                "signal": r["signal"],
-                "divergence_score": r["divergence_score"],
-                "status": r["status"],
+        # Handle unmapped high-divergence signals
+        if not matched and row["divergence_score"] >= HIGH_THRESHOLD_DEFAULT:
+            root_cause_rows.append({
+                "log_name": row["log_name"],
+                "signal": row["signal"],
+                "divergence_score": row["divergence_score"],
+                "status": row["status"],
                 "probable_root_cause": "Unmapped high-divergence signal",
                 "interpretation": "Signal diverges strongly from passed reference but no specific rule matched.",
                 "mapped_error_bit": None,
                 "mapped_error_name": "Review manually",
                 "mapped_error_status_value": "",
                 "error_description": "",
-                "evidence": r["reason"],
+                "evidence": row["reason"],
             })
 
-    root_df = pd.DataFrame(root_rows)
+    root_df = pd.DataFrame(root_cause_rows)
     if root_df.empty:
         return root_df
 
+    # Rank by divergence score
     root_df["rank_score"] = root_df["divergence_score"]
     root_df = root_df.sort_values("rank_score", ascending=False)
     return root_df.head(top_n)
@@ -880,12 +1021,15 @@ BEHAVIOR_GROUPS = {
 
 
 def behavior_for_signal(signal: str) -> str:
+    """Categorize signal into behavioral groups for matrix display."""
     s = signal.lower()
+
+    # Check predefined behavior groups
     for behavior, keywords in BEHAVIOR_GROUPS.items():
-        if all(k in s for k in keywords):
+        if all(keyword in s for keyword in keywords):
             return behavior
 
-    # Looser fallback.
+    # Fallback categorization
     if "wheel" in s:
         return "Wheel speeds / motion inputs"
     if "can" in s:
@@ -894,55 +1038,50 @@ def behavior_for_signal(signal: str) -> str:
         return "Ignition / RBS"
     if "gkn_hil" in s:
         return "HIL motion panel"
+
     return "Other signals"
 
 
 def build_divergence_matrix(divergence_df: pd.DataFrame) -> pd.DataFrame:
+    """Build a matrix view of divergence by behavior categories and logs."""
     if divergence_df.empty:
         return pd.DataFrame()
 
     df = divergence_df.copy()
     df["behavior"] = df["signal"].apply(behavior_for_signal)
 
+    # Aggregate by behavior and log
     agg = (
         df.groupby(["behavior", "log_name"])
         .agg(
             max_score=("divergence_score", "max"),
-            top_signal=("signal", lambda x: x.iloc[0]),
+            top_signal=("signal", lambda x: x.iloc[0] if len(x) > 0 else ""),
             reasons=("reason", lambda x: "; ".join(pd.Series(x).dropna().astype(str).head(2)))
         )
         .reset_index()
     )
 
-    def status_from_score(score):
-        if score >= 60:
-            return "❌"
-        if score >= 25:
-            return "⚠️"
-        return "✅"
+    # Add status and cell formatting
+    agg["status"] = agg["max_score"].apply(lambda score: determine_status_and_severity(score)[0])
+    agg["cell"] = agg.apply(lambda r: f"{r['status']} ({r['max_score']:.0f})", axis=1)
 
-    agg["status"] = agg["max_score"].apply(status_from_score)
-    agg["cell"] = agg.apply(
-        lambda r: f"{r['status']} ({r['max_score']:.0f})",
-        axis=1
-    )
-
+    # Pivot to matrix format
     matrix = agg.pivot(index="behavior", columns="log_name", values="cell").fillna("✅")
     matrix = matrix.reset_index().rename(columns={"behavior": "Signal / Behavior"})
 
-    # Add interpretation column from highest divergence per behavior.
+    # Add interpretation column
     interpretations = []
     for behavior in matrix["Signal / Behavior"]:
-        sub = agg[agg["behavior"] == behavior].sort_values("max_score", ascending=False)
-        if sub.empty:
+        behavior_data = agg[agg["behavior"] == behavior].sort_values("max_score", ascending=False)
+        if behavior_data.empty:
             interpretations.append("Matches passed reference behavior")
         else:
-            score = sub.iloc[0]["max_score"]
-            reason = sub.iloc[0]["reasons"]
-            if score >= 60:
-                interpretations.append(f"Divergent from passed reference: {reason}")
-            elif score >= 25:
-                interpretations.append(f"Transitional / unstable: {reason}")
+            top_score = behavior_data.iloc[0]["max_score"]
+            top_reason = behavior_data.iloc[0]["reasons"]
+            if top_score >= HIGH_THRESHOLD_DEFAULT:
+                interpretations.append(f"Divergent from passed reference: {top_reason}")
+            elif top_score >= WARN_THRESHOLD_DEFAULT:
+                interpretations.append(f"Transitional / unstable: {top_reason}")
             else:
                 interpretations.append("Matches passed reference behavior")
 
@@ -951,10 +1090,12 @@ def build_divergence_matrix(divergence_df: pd.DataFrame) -> pd.DataFrame:
 
 
 def heatmap_from_divergence(divergence_df: pd.DataFrame):
+    """Create a heatmap visualization of signal divergence across logs."""
     if divergence_df.empty:
         return None
 
-    top = (
+    # Select top 40 most divergent signals for visualization
+    top_signals = (
         divergence_df.groupby("signal")["divergence_score"]
         .max()
         .sort_values(ascending=False)
@@ -962,8 +1103,8 @@ def heatmap_from_divergence(divergence_df: pd.DataFrame):
         .index
     )
 
-    hdf = divergence_df[divergence_df["signal"].isin(top)].copy()
-    pivot = hdf.pivot_table(
+    heatmap_data = divergence_df[divergence_df["signal"].isin(top_signals)].copy()
+    pivot = heatmap_data.pivot_table(
         index="signal",
         columns="log_name",
         values="divergence_score",
@@ -982,53 +1123,56 @@ def heatmap_from_divergence(divergence_df: pd.DataFrame):
     return fig
 
 
-# ============================================================
-# Optional Isolation Forest anomaly model across logs
-# ============================================================
-
 def isolation_forest_log_anomaly(all_logs: List[ParsedLog]) -> pd.DataFrame:
     """
-    Log-level anomaly model using aggregate feature vectors.
-    Works best with multiple passed and failed logs.
+    Apply log-level anomaly detection using aggregate features.
+
+    Works best with multiple passed and failed logs to establish baseline behavior.
     """
-    rows = []
+    log_features = []
     for log in all_logs:
-        f = log.features
-        if f.empty:
+        if log.features.empty:
             continue
-        rows.append({
+
+        features = log.features
+        log_features.append({
             "log_name": log.name,
             "label": log.label,
-            "n_signals": f["signal"].nunique(),
-            "mean_zero_frac": pd.to_numeric(f["zero_frac"], errors="coerce").mean(),
-            "mean_one_frac": pd.to_numeric(f["one_frac"], errors="coerce").mean(),
-            "mean_transitions": pd.to_numeric(f["transitions"], errors="coerce").mean(),
-            "mean_span": pd.to_numeric(f["span"], errors="coerce").mean(),
-            "can_status_count": int(f["signal"].str.lower().str.contains("can").sum()),
-            "inv_signal_count": int(f["signal"].str.lower().str.contains("_inv").sum()),
-            "static_zero_signals": int(((pd.to_numeric(f["zero_frac"], errors="coerce") > 0.95) &
-                                        (pd.to_numeric(f["span"], errors="coerce") == 0)).sum())
+            "n_signals": features["signal"].nunique(),
+            "mean_zero_frac": pd.to_numeric(features["zero_frac"], errors="coerce").mean(),
+            "mean_one_frac": pd.to_numeric(features["one_frac"], errors="coerce").mean(),
+            "mean_transitions": pd.to_numeric(features["transitions"], errors="coerce").mean(),
+            "mean_span": pd.to_numeric(features["span"], errors="coerce").mean(),
+            "can_status_count": int(features["signal"].str.lower().str.contains("can").sum()),
+            "inv_signal_count": int(features["signal"].str.lower().str.contains("_inv").sum()),
+            "static_zero_signals": int(
+                ((pd.to_numeric(features["zero_frac"], errors="coerce") > 0.95) &
+                 (pd.to_numeric(features["span"], errors="coerce") == 0)).sum()
+            )
         })
 
-    df = pd.DataFrame(rows)
+    df = pd.DataFrame(log_features)
     if len(df) < 3:
         df["iforest_score"] = np.nan
         df["iforest_flag"] = "Need >=3 logs"
         return df
 
-    X_cols = [
+    # Feature columns for log-level anomaly detection
+    feature_cols = [
         "n_signals", "mean_zero_frac", "mean_one_frac", "mean_transitions",
         "mean_span", "can_status_count", "inv_signal_count", "static_zero_signals"
     ]
-    X = df[X_cols].fillna(0)
+    X = df[feature_cols].fillna(0)
 
+    # Adaptive contamination based on failed log ratio
     contamination = min(0.45, max(0.05, len(df[df["label"] == "failed"]) / max(len(df), 1)))
-    model = IsolationForest(random_state=42, contamination=contamination)
-    pred = model.fit_predict(X)
-    score = -model.score_samples(X)
+    model = IsolationForest(random_state=RANDOM_STATE, contamination=contamination)
 
-    df["iforest_score"] = score
-    df["iforest_flag"] = np.where(pred == -1, "Anomalous", "Normal")
+    predictions = model.fit_predict(X)
+    scores = -model.score_samples(X)
+
+    df["iforest_score"] = scores
+    df["iforest_flag"] = np.where(predictions == -1, "Anomalous", "Normal")
     return df.sort_values("iforest_score", ascending=False)
 
 
@@ -1036,6 +1180,7 @@ def isolation_forest_log_anomaly(all_logs: List[ParsedLog]) -> pd.DataFrame:
 # Streamlit UI
 # ============================================================
 
+# Page configuration
 st.set_page_config(
     page_title="EOL Divergence Matrix & Root Cause Dashboard",
     layout="wide"
@@ -1052,6 +1197,7 @@ simultaneous divergence matrix.
 """
 )
 
+# Sidebar configuration
 with st.sidebar:
     st.header("1. Select input logs")
 
@@ -1070,9 +1216,9 @@ with st.sidebar:
     )
 
     st.header("2. Detection settings")
-    high_threshold = st.slider("High divergence threshold", 40, 90, 60)
-    warn_threshold = st.slider("Warning divergence threshold", 10, 50, 25)
-    top_root_causes = st.slider("Root-cause rows to show", 3, 20, 8)
+    high_threshold = st.slider("High divergence threshold", 40, 90, HIGH_THRESHOLD_DEFAULT)
+    warn_threshold = st.slider("Warning divergence threshold", 10, 50, WARN_THRESHOLD_DEFAULT)
+    top_root_causes = st.slider("Root-cause rows to show", 3, 20, TOP_ROOT_CAUSES_DEFAULT)
 
     st.header("3. Signal filter")
     signal_filter = st.text_input(
@@ -1086,28 +1232,27 @@ if not passed_files or not failed_files:
     st.info("Use the file browser in the left sidebar to upload at least one passed log and one failed log.")
     st.stop()
 
-
-# Parse files.
-passed_logs = []
-failed_logs = []
+# Parse uploaded files
+@st.cache_data
+def parse_logs(files, label):
+    """Parse multiple log files with caching."""
+    logs = []
+    for f in files:
+        text = read_uploaded_file(f)
+        logs.append(parse_log_text(text, f.name, label))
+    return logs
 
 with st.spinner("Parsing logs..."):
-    for f in passed_files:
-        text = read_uploaded_file(f)
-        passed_logs.append(parse_log_text(text, f.name, "passed"))
-
-    for f in failed_files:
-        text = read_uploaded_file(f)
-        failed_logs.append(parse_log_text(text, f.name, "failed"))
+    passed_logs = parse_logs(passed_files, "passed")
+    failed_logs = parse_logs(failed_files, "failed")
 
 all_logs = passed_logs + failed_logs
 
-# Show metadata.
+# Display log metadata
 st.subheader("Uploaded logs")
-
-meta_rows = []
+metadata_rows = []
 for log in all_logs:
-    meta_rows.append({
+    metadata_rows.append({
         "log_name": log.name,
         "label": log.label,
         "events_parsed": len(log.events),
@@ -1116,29 +1261,24 @@ for log in all_logs:
         "version": log.metadata.get("version", ""),
         "measurement_uuid": log.metadata.get("measurement_uuid", "")
     })
-st.dataframe(pd.DataFrame(meta_rows), use_container_width=True)
+st.dataframe(pd.DataFrame(metadata_rows), use_container_width=True)
 
-
-# Build reference and compare.
+# Build reference profile and train ML model
 ref_profile = build_reference_profile(passed_logs)
 
-# Train ML model on PASS logs (learn acceptable patterns)
-# You can optionally expose contamination as a UI slider later, but not required.
+# Cache the trained model
 if "pass_model" not in st.session_state:
-    st.session_state["pass_model"] = train_pass_iforest_model(
-        passed_logs,
-        contamination=0.03,
-        n_estimators=200
-    )
+    st.session_state["pass_model"] = train_pass_iforest_model(passed_logs)
 pass_model = st.session_state["pass_model"]
 
+# Compare failed logs to reference
 all_divergence = []
 for log in failed_logs:
-    d = compare_to_pass_model(log, ref_profile, pass_model)
-    if not d.empty:
-        if signal_filter:
-            d = d[d["signal"].str.contains(signal_filter, case=False, na=False)]
-        all_divergence.append(d)
+    divergence = compare_to_pass_model(log, ref_profile, pass_model)
+    if not divergence.empty and signal_filter:
+        divergence = divergence[divergence["signal"].str.contains(signal_filter, case=False, na=False)]
+    if not divergence.empty:
+        all_divergence.append(divergence)
 
 if not all_divergence:
     st.warning("No comparable signals were found. Check that passed and failed logs use similar signal naming.")
@@ -1146,7 +1286,7 @@ if not all_divergence:
 
 divergence_df = pd.concat(all_divergence, ignore_index=True)
 
-# Apply UI thresholds.
+# Apply user-defined thresholds
 divergence_df["status"] = np.where(
     divergence_df["divergence_score"] >= high_threshold, "❌",
     np.where(divergence_df["divergence_score"] >= warn_threshold, "⚠️", "✅")
@@ -1156,7 +1296,7 @@ divergence_df["severity"] = np.where(
     np.where(divergence_df["divergence_score"] >= warn_threshold, "Medium", "Low")
 )
 
-# KPI row.
+# KPI Metrics
 high_count = int((divergence_df["severity"] == "High").sum())
 warn_count = int((divergence_df["severity"] == "Medium").sum())
 ok_count = int((divergence_df["severity"] == "Low").sum())
@@ -1167,8 +1307,7 @@ k2.metric("High divergences", high_count)
 k3.metric("Warnings", warn_count)
 k4.metric("Matched / low", ok_count)
 
-
-# Tabs.
+# Main content tabs
 tab_matrix, tab_root, tab_heatmap, tab_details, tab_model, tab_error = st.tabs([
     "Divergence Matrix",
     "Root Cause",
@@ -1180,20 +1319,15 @@ tab_matrix, tab_root, tab_heatmap, tab_details, tab_model, tab_error = st.tabs([
 
 with tab_matrix:
     st.subheader("Simultaneous Divergence Matrix")
-
-    st.markdown(
-        """
-Legend: ✅ matches passed reference behavior &nbsp;&nbsp; ❌ divergent from passed reference &nbsp;&nbsp; ⚠️ transitional / unstable.
-        """
-    )
+    st.markdown("Legend: ✅ matches passed reference behavior &nbsp;&nbsp; ❌ divergent from passed reference &nbsp;&nbsp; ⚠️ transitional / unstable.")
 
     matrix = build_divergence_matrix(divergence_df)
     st.dataframe(matrix, use_container_width=True, hide_index=True)
 
-    csv = matrix.to_csv(index=False).encode("utf-8")
+    csv_data = matrix.to_csv(index=False).encode("utf-8")
     st.download_button(
         "Download divergence matrix CSV",
-        data=csv,
+        data=csv_data,
         file_name="divergence_matrix.csv",
         mime="text/csv"
     )
@@ -1208,21 +1342,21 @@ with tab_root:
     else:
         st.dataframe(root_df.drop(columns=["rank_score"], errors="ignore"), use_container_width=True)
 
-        top = root_df.iloc[0]
+        top_cause = root_df.iloc[0]
         st.markdown("### Top hypothesis")
         st.error(
             f"""
-**Root cause:** {top['probable_root_cause']}  
-**Evidence signal:** `{top['signal']}`  
-**Mapped error:** Bit {top['mapped_error_bit']} — {top['mapped_error_name']}  
-**Evidence:** {top['evidence']}
+**Root cause:** {top_cause['probable_root_cause']}  
+**Evidence signal:** `{top_cause['signal']}`  
+**Mapped error:** Bit {top_cause['mapped_error_bit']} — {top_cause['mapped_error_name']}  
+**Evidence:** {top_cause['evidence']}
 """
         )
 
-        csv = root_df.to_csv(index=False).encode("utf-8")
+        csv_data = root_df.to_csv(index=False).encode("utf-8")
         st.download_button(
             "Download root-cause report CSV",
-            data=csv,
+            data=csv_data,
             file_name="root_cause_report.csv",
             mime="text/csv"
         )
@@ -1239,11 +1373,8 @@ with tab_heatmap:
 with tab_details:
     st.subheader("Signal-Level Divergence Details")
 
-    sort_col = st.selectbox(
-        "Sort by",
-        ["divergence_score", "signal", "log_name", "severity"],
-        index=0
-    )
+    sort_options = ["divergence_score", "signal", "log_name", "severity"]
+    sort_col = st.selectbox("Sort by", sort_options, index=0)
 
     st.dataframe(
         divergence_df.sort_values(sort_col, ascending=False),
@@ -1251,10 +1382,10 @@ with tab_details:
         hide_index=True
     )
 
-    csv = divergence_df.to_csv(index=False).encode("utf-8")
+    csv_data = divergence_df.to_csv(index=False).encode("utf-8")
     st.download_button(
         "Download signal divergence detail CSV",
-        data=csv,
+        data=csv_data,
         file_name="signal_divergence_detail.csv",
         mime="text/csv"
     )
@@ -1279,7 +1410,7 @@ with tab_model:
 with tab_error:
     st.subheader("Error Code Reference")
 
-    error_df = pd.DataFrame([
+    error_code_data = [
         {
             "Error Bit": bit,
             "Error Status Value": info["status_value"],
@@ -1288,6 +1419,6 @@ with tab_error:
             "Root Cause Hint": info["root_hint"],
         }
         for bit, info in ERROR_CODES.items()
-    ])
-
+    ]
+    error_df = pd.DataFrame(error_code_data)
     st.dataframe(error_df, use_container_width=True, hide_index=True)
