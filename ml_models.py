@@ -3,6 +3,7 @@
 from typing import Dict, List, Optional, Union, Tuple, Set
 import numpy as np
 import pandas as pd
+import plotly.express as px
 from sklearn.ensemble import IsolationForest
 from sklearn.preprocessing import StandardScaler
 from sklearn.feature_extraction import FeatureHasher
@@ -358,17 +359,25 @@ def identify_root_causes(divergence_df: pd.DataFrame, top_n: int = TOP_ROOT_CAUS
         matched = False
 
         # Check against predefined root cause rules
-        for rule in ROOT_CAUSE_RULES:
-            if all(pattern in signal for pattern in rule["pattern"]):
-                for error_bit in rule["error_bits"]:
+        if isinstance(ROOT_CAUSE_RULES, dict):
+            rules_iter = ROOT_CAUSE_RULES.items()
+        else:
+            rules_iter = ((rule.get("root_cause", f"rule_{idx}"), rule) for idx, rule in enumerate(ROOT_CAUSE_RULES))
+
+        for rule_name, rule in rules_iter:
+            patterns = rule.get("signals") or rule.get("pattern") or []
+            if all(pattern in signal for pattern in patterns):
+                probable_root_cause = rule.get("root_cause", rule_name)
+                interpretation = rule.get("interpretation", "")
+                for error_bit in rule.get("error_bits", []):
                     error_info = ERROR_CODES.get(error_bit, {})
                     root_cause_rows.append({
                         "log_name": row["log_name"],
                         "signal": row["signal"],
                         "divergence_score": row["divergence_score"],
                         "status": row["status"],
-                        "probable_root_cause": rule["root_cause"],
-                        "interpretation": rule["interpretation"],
+                        "probable_root_cause": probable_root_cause,
+                        "interpretation": interpretation,
                         "mapped_error_bit": error_bit,
                         "mapped_error_name": error_info.get("name", ""),
                         "mapped_error_status_value": error_info.get("status_value", ""),
