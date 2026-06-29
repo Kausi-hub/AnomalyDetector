@@ -37,6 +37,14 @@ def categorize_signal(name):
         return "Voltage"
     return "Other"
 
+def confidence_label(val):
+    if val >= 75:
+        return "🟢"
+    elif val >= 40:
+        return "🟡"
+    else:
+        return "🔴"
+
 # ==============================
 # CSV PARSER
 # ==============================
@@ -99,6 +107,7 @@ def parse_txt(file):
     messages = []
 
     for line in lines:
+
         if line.lower().startswith("date"):
             try:
                 start = datetime.strptime(
@@ -160,7 +169,7 @@ def msg_similarity(m1, m2):
     total = sum(c1.values()) + sum(c2.values())
     return (2 * overlap / total) * 100
 
-def best_signals(csv, txt, pairs, top_n=3):
+def best_signals(csv, txt, pairs):
     scored = []
     for c, t in pairs:
         s1 = pd.Series(csv[c]["values"])
@@ -172,10 +181,10 @@ def best_signals(csv, txt, pairs, top_n=3):
         if pd.notna(corr):
             scored.append((c, t, abs(corr)))
     scored.sort(key=lambda x: x[2], reverse=True)
-    return [(c, t) for c, t, _ in scored[:top_n]]
+    return [(c, t) for c, t, _ in scored[:3]]
 
 def confidence(diff, sig, msg):
-    return round(min(100, (0.4*(100 - diff/300*100) + 0.4*sig + 0.2*msg)), 1)
+    return round(min(100, (0.4 * (100 - diff/300*100) + 0.4 * sig + 0.2 * msg)), 1)
 
 # ==============================
 # ANALYSIS
@@ -188,6 +197,7 @@ def run(csv_runs, txt_runs):
         best_score = -1
 
         for csv in csv_runs:
+
             if not csv.get("start") or not txt.get("start"):
                 continue
 
@@ -263,21 +273,20 @@ st.info("Compare CSV and TXT logs using time, signals, and CAN patterns")
 
 with st.expander("ℹ️ How to Use This App"):
     st.markdown("""
-- Upload CSV (measurement) and TXT (log) files  
+- Upload CSV & TXT files  
 - Run analysis  
-- Review matches, timeline, and signal plots  
-- Use filters and plots to validate runs  
+- Review match table, timeline & signals  
 
-🟢 Strong match ≥75  
-🟡 Partial match 40–74  
-🔴 Weak match <40  
+🟢 Strong ≥75 | 🟡 Partial 40–74 | 🔴 Weak <40  
 """)
 
 csv_files = st.file_uploader("Upload CSV", accept_multiple_files=True)
 txt_files = st.file_uploader("Upload TXT", accept_multiple_files=True)
 
 if st.button("Run Analysis"):
+
     with st.spinner("Analyzing..."):
+
         csv_runs = [r for f in csv_files if (r := parse_csv(f))]
         txt_runs = [r for f in txt_files if (r := parse_txt(f))]
 
@@ -302,16 +311,15 @@ if "df" in st.session_state:
     df = st.session_state["df"]
     matches = st.session_state["matches"]
 
-    def color_conf(val):
-        if val >= 75:
-            return "background-color:#b6f2c2"
-        elif val >= 40:
-            return "background-color:#ffe8a3"
-        else:
-            return "background-color:#f5b7b1"
+    # ✅ Cloud-safe RYG display
+    display_df = df.copy()
+    display_df["Match"] = display_df["Confidence"].apply(confidence_label)
+
+    cols = ["Match"] + [c for c in display_df.columns if c != "Match"]
+    display_df = display_df[cols]
 
     st.subheader("📋 Results")
-    st.dataframe(df.style.applymap(color_conf, subset=["Confidence"]))
+    st.dataframe(display_df, use_container_width=True)
 
     st.caption("🟢 Strong | 🟡 Partial | 🔴 Weak")
 
@@ -337,11 +345,8 @@ if "df" in st.session_state:
 
     options = [f"{c} ↔ {t}" for c, t in filtered]
 
-    selected = st.multiselect(
-        "Signals",
-        options,
-        default=[f"{c} ↔ {t}" for c, t in best]
-    )
+    selected = st.multiselect("Signals", options,
+                             default=[f"{c} ↔ {t}" for c, t in best])
 
     fig = go.Figure()
 
@@ -357,7 +362,7 @@ if "df" in st.session_state:
         fig.add_trace(go.Scatter(x=x, y=b[:L], name=f"TXT {t}",
                                  line=dict(dash="dot")))
 
-    st.plotly_chart(fig)
+    st.plotly_chart(fig, use_container_width=True)
 
     st.subheader("🧠 Explanation")
     row = df.iloc[idx]
