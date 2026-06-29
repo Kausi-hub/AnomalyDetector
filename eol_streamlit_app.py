@@ -1,10 +1,13 @@
 import re
 from datetime import datetime, timedelta
-from collections import defaultdict, Counter
+from collections import defaultdict
+from io import BytesIO
 
 import pandas as pd
 import streamlit as st
 import plotly.graph_objects as go
+from openpyxl import Workbook
+from openpyxl.styles import PatternFill
 
 # ==============================
 # CONFIG
@@ -14,39 +17,25 @@ TIME_THRESHOLD_SEC = 300
 # ==============================
 # HELPERS
 # ==============================
-def extract_unit(name):
-    m = re.search(r"(\d{4,})", name)
-    return m.group(1) if m else "UNKNOWN"
-
-def normalize_name(name):
+def normalize(name):
     name = name.lower()
     name = re.sub(r".*::", "", name)
-    name = re.sub(r"^v_|^measured|^rig_", "", name)
     name = re.sub(r"[_\s]+", "", name)
     return name
 
-def categorize_signal(name):
+def category(name):
     n = name.lower()
-    if "speed" in n:
-        return "Speed"
-    elif "torque" in n:
-        return "Torque"
-    elif "temp" in n:
-        return "Temperature"
-    elif "volt" in n:
-        return "Voltage"
+    if "speed" in n: return "Speed"
+    if "torque" in n: return "Torque"
+    if "temp" in n: return "Temperature"
+    if "volt" in n: return "Voltage"
     return "Other"
 
-def confidence_label(val):
-    if val >= 75:
-        return "🟢"
-    elif val >= 40:
-        return "🟡"
-    else:
-        return "🔴"
+def ryg(val):
+    return "🟢" if val >= 75 else "🟡" if val >= 40 else "🔴"
 
 # ==============================
-# CSV PARSER
+# PARSERS
 # ==============================
 def parse_csv(file):
     lines = file.getvalue().decode(errors="ignore").splitlines()
@@ -58,315 +47,256 @@ def parse_csv(file):
     for line in lines:
         if "StartMeasDateTime" in line:
             start = datetime.strptime(line.split(",")[1].strip(), "%Y/%m/%d %H:%M:%S")
-
         if "TotalMeasTime" in line:
             dur = float(line.split(",")[1])
-
         if line.startswith("Time,"):
-            headers = [h.strip() for h in line.split(",")]
+            headers = line.split(",")
             reading = True
             continue
-
-        if reading and re.match(r"\s*\d+\.\d+", line):
+        if reading and "," in line:
             data.append(line.split(","))
 
-    if not start or not dur or not headers or not data:
+    if not start or not dur or not data:
         return None
 
-    clean = []
-    for r in data:
-        if len(r) < len(headers):
-            r += [None] * (len(headers) - len(r))
-        elif len(r) > len(headers):
-            r = r[:len(headers)]
-        clean.append(r)
+    df = pd.DataFrame(data, columns=headers).apply(pd.to_numeric, errors="coerce")
 
-    df = pd.DataFrame(clean, columns=headers).apply(pd.to_numeric, errors="coerce")
+    signals = {normalize(c): {"values": df[c].dropna().values} for c in df.columns}
 
-    signals = {
-        normalize_name(col): {"values": df[col].dropna().values}
-        for col in df.columns
-    }
+    return {"file": file.name, "start": start, "end": start + timedelta(minutes=dur), "signals": signals}
 
-    return {
-        "file": file.name,
-        "start": start,
-        "end": start + timedelta(minutes=dur),
-        "unit": extract_unit(file.name),
-        "signals": signals
-    }
-
-# ==============================
-# TXT PARSER
-# ==============================
 def parse_txt(file):
     lines = file.getvalue().decode(errors="ignore").splitlines()
 
     start, last = None, 0
     signals = defaultdict(list)
-    messages = []
 
     for line in lines:
-
         if line.lower().startswith("date"):
             try:
-                start = datetime.strptime(
-                    line.replace("date", "").strip(),
-                    "%a %b %d %I:%M:%S.%f %p %Y"
-                )
-            except:
-                pass
+                start = datetime.strptime(line.replace("date","").strip(), "%a %b %d %I:%M:%S.%f %p %Y")
+            except: pass
 
         t = re.match(r"\s*(\d+\.\d+)", line)
-        if t:
-            last = float(t.group(1))
+        if t: last = float(t.group(1))
 
         m = re.search(r"::([\w]+)\s*=\s*([-\d\.]+)", line)
         if m:
-            signals[normalize_name(m.group(1))].append(float(m.group(2)))
-
-        m = re.search(r"CANFD.*Tx\s+([0-9A-Fa-f]+)", line)
-        if m:
-            messages.append(m.group(1))
+            signals[normalize(m.group(1))].append(float(m.group(2)))
 
     if not start:
         return None
 
-    return {
-        "file": file.name,
-        "start": start,
-        "end": start + timedelta(seconds=last),
-        "unit": extract_unit(file.name),
-        "signals": signals,
-        "messages": messages
-    }
+    return {"file": file.name, "start": start, "end": start + timedelta(seconds=last), "signals": signals}
 
 # ==============================
 # MATCHING
 # ==============================
 def find_pairs(csv, txt):
-    return [(c, t) for c in csv for t in txt if c in t or t in c]
+    return [(c,t) for c in csv for t in txt if c in t or t in c]
 
 def signal_similarity(csv, txt, pairs):
-    scores = []
-    for c, t in pairs:
-        s1 = pd.Series(csv[c]["values"])
-        s2 = pd.Series(txt[t])
-        if len(s1) < 10 or len(s2) < 10:
-            continue
-        m = min(len(s1), len(s2))
-        corr = s1[:m].corr(s2[:m])
-        if pd.notna(corr):
-            scores.append(max(0, corr))
-    return round((sum(scores) / len(scores)) * 100, 1) if scores else 0
-
-def msg_similarity(m1, m2):
-    c1, c2 = Counter(m1), Counter(m2)
-    common = set(c1) & set(c2)
-    if not common:
-        return 0
-    overlap = sum(min(c1[k], c2[k]) for k in common)
-    total = sum(c1.values()) + sum(c2.values())
-    return (2 * overlap / total) * 100
+    scores=[]
+    for c,t in pairs:
+        a,b=csv[c]["values"],txt[t]
+        if len(a)<10 or len(b)<10: continue
+        m=min(len(a),len(b))
+        scores.append(pd.Series(a[:m]).corr(pd.Series(b[:m])))
+    return round(max(0,sum(scores)/len(scores))*100,1) if scores else 0
 
 def best_signals(csv, txt, pairs):
-    scored = []
-    for c, t in pairs:
-        s1 = pd.Series(csv[c]["values"])
-        s2 = pd.Series(txt[t])
-        if len(s1) < 10 or len(s2) < 10:
-            continue
-        m = min(len(s1), len(s2))
-        corr = s1[:m].corr(s2[:m])
+    scored=[]
+    for c,t in pairs:
+        a,b=csv[c]["values"],txt[t]
+        if len(a)<10 or len(b)<10: continue
+        m=min(len(a),len(b))
+        corr=pd.Series(a[:m]).corr(pd.Series(b[:m]))
         if pd.notna(corr):
-            scored.append((c, t, abs(corr)))
-    scored.sort(key=lambda x: x[2], reverse=True)
-    return [(c, t) for c, t, _ in scored[:3]]
+            scored.append((c,t,abs(corr)))
+    scored.sort(key=lambda x:x[2],reverse=True)
+    return [(c,t) for c,t,_ in scored[:3]]
 
-def confidence(diff, sig, msg):
-    return round(min(100, (0.4 * (100 - diff/300*100) + 0.4 * sig + 0.2 * msg)), 1)
+def confidence(diff, sig):
+    return round(min(100,0.5*(100-diff/300*100)+0.5*sig),1)
 
 # ==============================
 # ANALYSIS
 # ==============================
 def run(csv_runs, txt_runs):
-    rows, matches = [], []
+    rows=[]; matches=[]
 
     for txt in txt_runs:
-        best = None
-        best_score = -1
+        best=None; best_score=-1
 
         for csv in csv_runs:
+            diff=abs((txt["start"]-csv["start"]).total_seconds())
+            pairs=find_pairs(csv["signals"],txt["signals"])
+            sig=signal_similarity(csv["signals"],txt["signals"],pairs)
+            conf=confidence(diff,sig)
 
-            if not csv.get("start") or not txt.get("start"):
-                continue
+            if best is None or conf>best_score:
+                best=(csv,diff,conf,sig,pairs)
+                best_score=conf
 
-            diff = abs((txt["start"] - csv["start"]).total_seconds())
-            pairs = find_pairs(csv["signals"], txt["signals"])
-            sig = signal_similarity(csv["signals"], txt["signals"], pairs)
-            msg = msg_similarity(txt["messages"], [])
-            conf = confidence(diff, sig, msg)
+        if best is None: continue
 
-            if best is None or conf > best_score:
-                best_score = conf
-                best = (csv, diff, conf, sig, msg, pairs)
+        csv,diff,conf,sig,pairs=best
 
-        if best is None:
-            continue
-
-        csv, diff, conf, sig, msg, pairs = best
-
-        status = (
-            "🟢 SAME RUN" if conf >= 75 else
-            "🟡 POSSIBLE MATCH" if conf >= 40 else
-            "🔴 DIFFERENT RUN"
-        )
-
-        matches.append({"csv": csv, "txt": txt, "pairs": pairs})
+        matches.append({"csv":csv,"txt":txt,"pairs":pairs})
 
         rows.append({
-            "TXT File": txt["file"],
-            "CSV File": csv["file"],
-            "Δ Time (s)": round(diff, 1),
-            "Signal Similarity": sig,
-            "Message Similarity": round(msg, 1),
-            "Confidence": conf,
-            "Status": status
+            "TXT File":txt["file"],
+            "CSV File":csv["file"],
+            "Δ Time (s)":round(diff,1),
+            "Signal Similarity":sig,
+            "Confidence":conf,
+            "Match":ryg(conf)
         })
 
-    return pd.DataFrame(rows), matches
+    return pd.DataFrame(rows),matches
 
 # ==============================
 # TIMELINE
 # ==============================
 def timeline(csv_runs, txt_runs, matches):
-    fig = go.Figure()
-    y = 0
-    pos = {}
+
+    fig=go.Figure()
+    y=0; pos={}
 
     for r in csv_runs:
-        fig.add_bar(x=[(r["end"]-r["start"]).seconds], y=[y],
-                    base=r["start"], orientation='h', marker=dict(color="blue"))
-        pos[r["file"]] = y; y += 1
+        fig.add_bar(x=[(r["end"]-r["start"]).seconds],y=[y],base=r["start"],orientation="h",marker=dict(color="blue"))
+        pos[r["file"]]=y; y+=1
 
     for r in txt_runs:
-        fig.add_bar(x=[(r["end"]-r["start"]).seconds], y=[y],
-                    base=r["start"], orientation='h', marker=dict(color="orange"))
-        pos[r["file"]] = y; y += 1
+        fig.add_bar(x=[(r["end"]-r["start"]).seconds],y=[y],base=r["start"],orientation="h",marker=dict(color="orange"))
+        pos[r["file"]]=y; y+=1
 
     for m in matches:
         fig.add_trace(go.Scatter(
-            x=[m["txt"]["start"], m["csv"]["start"]],
-            y=[pos[m["txt"]["file"]], pos[m["csv"]["file"]]],
-            mode="lines",
-            line=dict(dash="dot", color="gray")
+            x=[m["txt"]["start"],m["csv"]["start"]],
+            y=[pos[m["txt"]["file"]],pos[m["csv"]["file"]]],
+            mode="lines",line=dict(dash="dot",color="gray")
         ))
 
     return fig
+
+# ==============================
+# EXCEL EXPORT
+# ==============================
+def create_excel(df):
+
+    wb=Workbook(); ws=wb.active
+    green=PatternFill(start_color="C6EFCE",fill_type="solid")
+    yellow=PatternFill(start_color="FFEB9C",fill_type="solid")
+    red=PatternFill(start_color="FFC7CE",fill_type="solid")
+
+    for c,col in enumerate(df.columns,1):
+        ws.cell(1,c,col)
+
+    for r,row in enumerate(df.itertuples(index=False),2):
+        for c,val in enumerate(row,1):
+            cell=ws.cell(r,c,val)
+            if df.columns[c-1]=="Confidence":
+                if val>=75: cell.fill=green
+                elif val>=40: cell.fill=yellow
+                else: cell.fill=red
+
+    buf=BytesIO(); wb.save(buf); buf.seek(0)
+    return buf
 
 # ==============================
 # UI
 # ==============================
 st.title("EOL Matching Dashboard")
 
-st.info("Compare CSV and TXT logs using time, signals, and CAN patterns")
-
-with st.expander("ℹ️ How to Use This App"):
+with st.expander("ℹ️ Help"):
     st.markdown("""
-- Upload CSV & TXT files  
-- Run analysis  
-- Review match table, timeline & signals  
+Upload CSV + TXT → Run analysis  
 
-🟢 Strong ≥75 | 🟡 Partial 40–74 | 🔴 Weak <40  
+• Timeline shows run overlap  
+• Table shows match confidence  
+• Signal plots show behavior comparison  
+
+🟢 Strong | 🟡 Partial | 🔴 Weak  
 """)
 
-csv_files = st.file_uploader("Upload CSV", accept_multiple_files=True)
-txt_files = st.file_uploader("Upload TXT", accept_multiple_files=True)
+csv_files=st.file_uploader("CSV files",accept_multiple_files=True)
+txt_files=st.file_uploader("TXT files",accept_multiple_files=True)
 
+# ==============================
+# RUN ANALYSIS
+# ==============================
 if st.button("Run Analysis"):
 
-    with st.spinner("Analyzing..."):
+    csv_runs=[r for f in csv_files if (r:=parse_csv(f))]
+    txt_runs=[r for f in txt_files if (r:=parse_txt(f))]
 
-        csv_runs = [r for f in csv_files if (r := parse_csv(f))]
-        txt_runs = [r for f in txt_files if (r := parse_txt(f))]
+    df,matches=run(csv_runs,txt_runs)
 
-        if not csv_runs or not txt_runs:
-            st.error("No valid data")
-            st.stop()
+    st.session_state.update({"df":df,"matches":matches,"csv":csv_runs,"txt":txt_runs})
 
-        df, matches = run(csv_runs, txt_runs)
+    if "history" not in st.session_state:
+        st.session_state["history"]=[]
 
-        st.session_state.update({
-            "df": df,
-            "matches": matches,
-            "csv": csv_runs,
-            "txt": txt_runs
-        })
+    st.session_state["history"].append({
+        "time":datetime.now().strftime("%Y-%m-%d %H:%M"),
+        "data":df.copy()
+    })
 
 # ==============================
 # DISPLAY
 # ==============================
 if "df" in st.session_state:
 
-    df = st.session_state["df"]
-    matches = st.session_state["matches"]
+    df=st.session_state["df"]
 
-    # ✅ Cloud-safe RYG display
-    display_df = df.copy()
-    display_df["Match"] = display_df["Confidence"].apply(confidence_label)
-
-    cols = ["Match"] + [c for c in display_df.columns if c != "Match"]
-    display_df = display_df[cols]
-
-    st.subheader("📋 Results")
-    st.dataframe(display_df, use_container_width=True)
-
+    st.subheader("Results")
+    st.dataframe(df, use_container_width=True)
     st.caption("🟢 Strong | 🟡 Partial | 🔴 Weak")
 
-    st.subheader("📊 Timeline")
+    st.download_button("⬇️ Excel Report", create_excel(df), "results.xlsx")
+
+    st.subheader("Timeline")
     st.plotly_chart(timeline(
         st.session_state["csv"],
         st.session_state["txt"],
-        matches
+        st.session_state["matches"]
     ))
 
     st.caption("🔵 CSV | 🟠 TXT | ⋯ Matches")
 
-    idx = st.selectbox("Select Match", range(len(df)))
-    m = matches[idx]
+    idx=st.selectbox("Select Match",range(len(df)))
+    m=st.session_state["matches"][idx]
 
-    cat = st.selectbox("Signal Filter",
-                       ["All","Speed","Torque","Temperature","Voltage","Other"])
+    cat=st.selectbox("Filter",[ "All","Speed","Torque","Temperature","Voltage","Other"])
 
-    filtered = [(c, t) for c, t in m["pairs"]
-                if cat == "All" or categorize_signal(c) == cat]
+    pairs=[(c,t) for c,t in m["pairs"] if cat=="All" or category(c)==cat]
 
-    best = best_signals(m["csv"]["signals"], m["txt"]["signals"], filtered)
+    defaults=best_signals(m["csv"]["signals"],m["txt"]["signals"],pairs)
 
-    options = [f"{c} ↔ {t}" for c, t in filtered]
+    options=[f"{c} ↔ {t}" for c,t in pairs]
+    selected=st.multiselect("Signals",options,[f"{c} ↔ {t}" for c,t in defaults])
 
-    selected = st.multiselect("Signals", options,
-                             default=[f"{c} ↔ {t}" for c, t in best])
-
-    fig = go.Figure()
-
+    fig=go.Figure()
     for s in selected:
-        c, t = s.split(" ↔ ")
-        a = m["csv"]["signals"][c]["values"]
-        b = m["txt"]["signals"][t]
+        c,t=s.split(" ↔ ")
+        a=m["csv"]["signals"][c]["values"]
+        b=m["txt"]["signals"][t]
+        L=min(len(a),len(b))
+        x=list(range(L))
 
-        L = min(len(a), len(b))
-        x = list(range(L))
+        fig.add_trace(go.Scatter(x=x,y=a[:L],name=f"CSV {c}"))
+        fig.add_trace(go.Scatter(x=x,y=b[:L],name=f"TXT {t}",line=dict(dash="dot")))
 
-        fig.add_trace(go.Scatter(x=x, y=a[:L], name=f"CSV {c}"))
-        fig.add_trace(go.Scatter(x=x, y=b[:L], name=f"TXT {t}",
-                                 line=dict(dash="dot")))
+    st.plotly_chart(fig)
 
-    st.plotly_chart(fig, use_container_width=True)
+    st.subheader("Previous Runs")
 
-    st.subheader("🧠 Explanation")
-    row = df.iloc[idx]
-    st.write(f"Time diff: {row['Δ Time (s)']} sec")
-    st.write(f"Signal similarity: {row['Signal Similarity']}%")
-    st.write(f"Message similarity: {row['Message Similarity']}%")
-    st.write(f"Confidence: {row['Confidence']}%")
+    if st.session_state.get("history"):
+        labels=[f"{i}: {h['time']}" for i,h in enumerate(st.session_state["history"])]
+        sel=st.selectbox("Select Run",labels)
+        idx=int(sel.split(":")[0])
+        st.dataframe(st.session_state["history"][idx]["data"])
+
+    if st.button("Clear History"):
+        st.session_state["history"] = []
